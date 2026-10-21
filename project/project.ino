@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
@@ -12,7 +13,7 @@
 
 LilyGo_Class amoled;
 
-static const char* FW_VERSION = "v0.4.0";
+static const char* FW_VERSION = "v0.4.1";
 
 static lv_obj_t* tileview;
 static lv_obj_t* t1;              // Tile #1: start screen (US1.1)
@@ -25,6 +26,8 @@ static lv_obj_t* t3_label;
 // Settings (US3.2A, US3.3)
 static const char* STOPS[] = {"Campus Grasvik", "Karlskrona C", "Karlskrona centrum", "Handelshamnen", "Lyckeby centrum"};
 static const int STOP_COUNT = 5;
+// Trafiklab stop IDs, same order as STOPS (US1.2B)
+static const char* STOP_IDS[] = {"740032188", "740000230", "740023372", "740020699", "740000663"};
 static const char* TYPE_OPTIONS = "All\nBus\nTrain\nFerry";
 static const char* TYPE_NAMES[] = {"", "Bus", "Train", "Ferry"};
 
@@ -261,6 +264,39 @@ static void connect_wifi()
   }
 }
 
+// Function: Asks Trafiklab for departures from one stop and prints them (US1.2B test)
+static void test_trafiklab(int stop)
+{
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = String("https://realtime-api.trafiklab.se/v1/departures/") + STOP_IDS[stop] + "?key=" + TRAFIKLAB_API_KEY;
+
+  WiFiClientSecure client;
+  client.setInsecure();           // skip certificate check for now
+  HTTPClient http;
+  http.begin(client, url);
+  int code = http.GET();
+  Serial.printf("Trafiklab %s: HTTP %d\n", STOPS[stop], code);   // 200 = OK, 400 = bad stop ID, 401 = bad key
+
+  if (code == 200) {
+    JsonDocument data;
+    deserializeJson(data, http.getString());
+    JsonArray deps = data["departures"].as<JsonArray>();
+    Serial.printf("%d departures found\n", deps.size());
+
+    // Print the first 5 departures
+    int printed = 0;
+    for (JsonObject dep : deps) {
+      String time = dep["scheduled"] | "";
+      const char* line = dep["route"]["designation"] | "";
+      const char* dest = dep["route"]["direction"] | "";
+      Serial.printf("  %s  %s  %s\n", time.substring(11, 16).c_str(), line, dest);
+      if (++printed >= 5) break;
+    }
+  }
+  http.end();
+}
+
 // Must have function: Setup is run once on startup
 void setup()
 {
@@ -277,6 +313,9 @@ void setup()
   create_ui();
   lv_timer_handler();        // draw the start screen before waiting for WiFi
   connect_wifi();
+
+  // Test every stop ID once (results in the serial monitor)
+  for (int i = 0; i < STOP_COUNT; i++) test_trafiklab(i);
 }
 
 // Must have function: Loop runs continously on device after setup
