@@ -8,12 +8,13 @@
 #include <LilyGo_AMOLED.h>
 #include <LV_Helper.h>
 #include <lvgl.h>
+#include <Preferences.h>
 
 #include "secrets.h"
 
 LilyGo_Class amoled;
 
-static const char* FW_VERSION = "v0.5.0";
+static const char* FW_VERSION = "v0.6.0";
 
 static lv_obj_t* tileview;
 static lv_obj_t* t1;              // Tile #1: start screen (FR-01)
@@ -42,6 +43,10 @@ static lv_obj_t* departure_list;
 static JsonDocument live_data;
 static bool live_ok = false;      // true when the last download worked
 static lv_obj_t* data_label;      // shows the Trafiklab attribution (NF-03)
+
+// Saved default settings, kept in the ESP32 flash memory (FR-07, FR-08)
+static Preferences prefs;
+static lv_obj_t* settings_status; // short message after saving or resetting
 
 // Function: Sets a tile to dark or light colours
 static void apply_tile_colors(lv_obj_t* tile, lv_obj_t* label, bool dark)
@@ -160,6 +165,46 @@ static void show_departures()
   lv_label_set_text(data_label, "");
 }
 
+// Function: Reads the saved default stop and transport type, if there are any (FR-07)
+static void load_defaults()
+{
+  prefs.begin("settings", true);                    // true = read only
+  current_stop = prefs.getInt("stop", 0);
+  current_type = prefs.getInt("type", 0);
+  prefs.end();
+
+  // Guard against old or broken values
+  if (current_stop < 0 || current_stop >= STOP_COUNT) current_stop = 0;
+  if (current_type < 0 || current_type > 3)           current_type = 0;
+}
+
+// Function: Saves the current stop and transport type as the default (FR-07)
+static void on_save_clicked(lv_event_t* e)
+{
+  LV_UNUSED(e);
+  prefs.begin("settings", false);
+  prefs.putInt("stop", current_stop);
+  prefs.putInt("type", current_type);
+  prefs.end();
+
+  lv_label_set_text(settings_status, "Saved as default");
+  Serial.printf("Saved default: %s, type %d\n", STOPS[current_stop], current_type);
+}
+
+// Function: Goes back to the saved default stop and transport type (FR-08)
+static void on_reset_clicked(lv_event_t* e)
+{
+  LV_UNUSED(e);
+  load_defaults();
+  lv_dropdown_set_selected(stop_dropdown, current_stop);
+  lv_dropdown_set_selected(type_dropdown, current_type);
+  load_live_departures();
+  show_departures();
+
+  lv_label_set_text(settings_status, "Reset to default");
+  Serial.printf("Reset to default: %s, type %d\n", STOPS[current_stop], current_type);
+}
+
 // Function: Loads and shows departures for the stop chosen in the dropdown (FR-05)
 static void on_stop_changed(lv_event_t* e)
 {
@@ -241,14 +286,21 @@ static void create_ui()
     stop_dropdown = lv_dropdown_create(t2);
     lv_dropdown_set_options(stop_dropdown, stop_options.c_str());
     lv_obj_set_width(stop_dropdown, lv_pct(100));
+    lv_dropdown_set_selected(stop_dropdown, current_stop);   // start on the saved default (FR-07)
     lv_obj_add_event_cb(stop_dropdown, on_stop_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
     type_dropdown = lv_dropdown_create(t2);
     lv_dropdown_set_options(type_dropdown, TYPE_OPTIONS);
     lv_obj_set_width(type_dropdown, lv_pct(100));
+    lv_dropdown_set_selected(type_dropdown, current_type);   // start on the saved default (FR-07)
     lv_obj_add_event_cb(type_dropdown, on_type_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
     add_button(t2, "Show departures " LV_SYMBOL_RIGHT, on_show_clicked);
+
+    // Save and reset the default settings (FR-07, FR-08)
+    add_button(t2, LV_SYMBOL_SAVE " Save as default", on_save_clicked);
+    add_button(t2, LV_SYMBOL_REFRESH " Reset to default", on_reset_clicked);
+    settings_status = add_label(t2, "", &lv_font_montserrat_20);
   }
 
   // Tile #3: departure screen (FR-02)
@@ -341,6 +393,7 @@ void setup()
 
   beginLvglHelper(amoled);   // init LVGL for this board
 
+  load_defaults();           // start with the saved stop and transport type (FR-07)
   create_ui();
   lv_timer_handler();        // draw the start screen before waiting for WiFi
   connect_wifi();
@@ -348,7 +401,7 @@ void setup()
   // Test every stop ID once (results in the serial monitor)
   for (int i = 0; i < STOP_COUNT; i++) test_trafiklab(i);
 
-  // Show live departures for the first stop (FR-02)
+  // Show live departures for the saved (or first) stop (FR-02, FR-07)
   load_live_departures();
   show_departures();
 }
