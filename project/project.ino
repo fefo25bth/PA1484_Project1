@@ -8,28 +8,30 @@
 #include <LilyGo_AMOLED.h>
 #include <LV_Helper.h>
 #include <lvgl.h>
+#include <Preferences.h>
 
 #include "secrets.h"
 
 LilyGo_Class amoled;
 
-static const char* FW_VERSION = "v0.4.1";
+static const char* FW_VERSION = "v0.6.0";
 
 static lv_obj_t* tileview;
-static lv_obj_t* t1;              // Tile #1: start screen (US1.1)
-static lv_obj_t* t2;              // Tile #2: settings screen (US3.1)
-static lv_obj_t* t3;              // Tile #3: departure screen (US1.2A)
+static lv_obj_t* t1;              // Tile #1: start screen (FR-01)
+static lv_obj_t* t2;              // Tile #2: settings screen (FR-04)
+static lv_obj_t* t3;              // Tile #3: departure screen (FR-02)
 static lv_obj_t* t1_label;
 static lv_obj_t* t2_label;
 static lv_obj_t* t3_label;
 
-// Settings (US3.2A, US3.3)
+// Settings (FR-05, FR-06)
 static const char* STOPS[] = {"Campus Grasvik", "Karlskrona C", "Karlskrona centrum", "Handelshamnen", "Lyckeby centrum"};
 static const int STOP_COUNT = 5;
-// Trafiklab stop IDs, same order as STOPS (US1.2B)
+// Trafiklab stop IDs, same order as STOPS (FR-02, FR-05)
 static const char* STOP_IDS[] = {"740032188", "740000230", "740023372", "740020699", "740000663"};
 static const char* TYPE_OPTIONS = "All\nBus\nTrain\nFerry";
-static const char* TYPE_NAMES[] = {"", "Bus", "Train", "Ferry"};
+// The same types as Trafiklab names them in the live data, in dropdown order (FR-06)
+static const char* TYPE_API[] = {"", "BUS", "TRAIN", "BOAT"};
 
 static int current_stop = 0;
 static int current_type = 0;      // 0 = All
@@ -37,37 +39,16 @@ static lv_obj_t* stop_dropdown;
 static lv_obj_t* type_dropdown;
 static lv_obj_t* departure_list;
 
-// Demo departure data (US1.2A). Replaced by live Trafiklab data later.
-struct Departure {
-  int stop;                       // index in STOPS
-  const char* time;
-  const char* line;
-  const char* destination;
-  const char* type;               // "Bus", "Train" or "Ferry"
-  int delay_min;                  // 0 = on time, -1 = cancelled
-};
+// Live departure data from Trafiklab (FR-02)
+static JsonDocument live_data;
+static bool live_ok = false;      // true when the last download worked
+static lv_obj_t* data_label;      // shows the Trafiklab attribution (NF-03)
 
-static Departure DEMO[] = {
-  {0, "08:05", "1",    "Karlskrona C", "Bus",    0},
-  {0, "08:15", "6",    "Lyckeby",      "Bus",    3},
-  {0, "08:20", "1",    "Karlskrona C", "Bus",    0},
-  {0, "08:50", "1",    "Karlskrona C", "Bus",   -1},
-  {1, "08:02", "Kust", "Kalmar C",     "Train",  0},
-  {1, "08:10", "1",    "Grasvik",      "Bus",    0},
-  {1, "08:18", "Ore",  "Malmo C",      "Train",  7},
-  {1, "08:40", "500",  "Ronneby",      "Bus",    0},
-  {2, "08:04", "1",    "Grasvik",      "Bus",    0},
-  {2, "08:09", "4",    "Hasslo",       "Bus",    0},
-  {2, "08:14", "6",    "Lyckeby",      "Bus",    2},
-  {3, "08:30", "Boat", "Aspo",         "Ferry",  0},
-  {3, "09:15", "Boat", "Tjurko",       "Ferry",  0},
-  {3, "10:00", "Boat", "Sturko",       "Ferry", -1},
-  {4, "08:12", "6",    "Karlskrona C", "Bus",    0},
-  {4, "08:27", "6",    "Karlskrona C", "Bus",    4},
-};
-static const int DEMO_COUNT = 16;
+// Saved default settings, kept in the ESP32 flash memory (FR-07, FR-08)
+static Preferences prefs;
+static lv_obj_t* settings_status; // short message after saving or resetting
 
-// Function: Tile #2 Color change
+// Function: Sets a tile to dark or light colours
 static void apply_tile_colors(lv_obj_t* tile, lv_obj_t* label, bool dark)
 {
   // Background
@@ -106,41 +87,134 @@ static void make_column(lv_obj_t* tile)
   lv_obj_set_flex_flow(tile, LV_FLEX_FLOW_COLUMN);
 }
 
-// Function: Shows the demo departures for the chosen stop and transport type (US1.2A)
+// Function: Replaces å, ä, and ö, since the screen fonts do not have them
+static String to_ascii(String s)
+{
+  s.replace("å", "a"); s.replace("ä", "a"); s.replace("ö", "o");
+  s.replace("Å", "A"); s.replace("Ä", "A"); s.replace("Ö", "O");
+  return s;
+}
+
+// Function: Downloads live departures for the chosen stop from Trafiklab (FR-02, FR-05)
+static void load_live_departures()
+{
+  live_ok = false;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = String("https://realtime-api.trafiklab.se/v1/departures/") + STOP_IDS[current_stop] + "?key=" + TRAFIKLAB_API_KEY;
+
+  WiFiClientSecure client;
+  client.setInsecure();           // skip certificate check for now
+  HTTPClient http;
+  http.begin(client, url);
+  int code = http.GET();
+  Serial.printf("Live data for %s: HTTP %d\n", STOPS[current_stop], code);
+
+  if (code == 200) {
+    DeserializationError error = deserializeJson(live_data, http.getString());
+    live_ok = !error;
+  }
+  http.end();
+}
+
+// Function: Shows the live departures for the chosen stop and transport type (FR-02)
+static void show_live_departures()
+{
+  int shown = 0;
+  for (JsonObject dep : live_data["departures"].as<JsonArray>()) {
+    String type = dep["route"]["transport_mode"] | "";
+    if (current_type != 0 && type != TYPE_API[current_type]) continue;
+
+    String time = dep["scheduled"] | "";              // e.g. "2026-11-17T12:05:00"
+    String line = dep["route"]["designation"] | "";
+    String dest = to_ascii(dep["route"]["direction"] | "");
+    int delay_min = (dep["delay"] | 0) / 60;          // delay is given in seconds
+    bool cancelled = dep["canceled"] | false;
+
+    String status = "On time";
+    if (cancelled)          status = "Cancelled";
+    else if (delay_min > 0) status = "+" + String(delay_min) + " min";
+
+    String row = time.substring(11, 16) + "   " + line + "   " + dest + "   " + status;
+    lv_obj_t* label = add_label(departure_list, row.c_str(), &lv_font_montserrat_20);
+    lv_obj_set_width(label, lv_pct(100));
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    if (cancelled)          lv_obj_set_style_text_color(label, lv_color_hex(0xFF5252), 0);  // red
+    else if (delay_min > 0) lv_obj_set_style_text_color(label, lv_color_hex(0xFFD740), 0);  // yellow
+
+    if (++shown >= 15) break;     // keep the list short
+  }
+
+  if (shown == 0) add_label(departure_list, "No departures of this type.", &lv_font_montserrat_20);
+  lv_label_set_text(data_label, "Data: Trafiklab.se (CC BY 4.0)");
+}
+
+// Function: Shows the departures for the chosen stop and transport type (FR-02)
 static void show_departures()
 {
   lv_label_set_text(t3_label, STOPS[current_stop]);
   lv_obj_clean(departure_list);
 
-  int shown = 0;
-  for (int i = 0; i < DEMO_COUNT; i++) {
-    Departure& dep = DEMO[i];
-    if (dep.stop != current_stop) continue;
-    if (current_type != 0 && strcmp(dep.type, TYPE_NAMES[current_type]) != 0) continue;
-
-    String status = "On time";
-    if (dep.delay_min == -1)    status = "Cancelled";
-    else if (dep.delay_min > 0) status = "+" + String(dep.delay_min) + " min";
-
-    String row = String(dep.time) + "   " + dep.line + "   " + dep.destination + "   " + status;
-    lv_obj_t* label = add_label(departure_list, row.c_str(), &lv_font_montserrat_20);
-    lv_obj_set_width(label, lv_pct(100));
-    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-    if (dep.delay_min == -1)    lv_obj_set_style_text_color(label, lv_color_hex(0xFF5252), 0);  // red
-    else if (dep.delay_min > 0) lv_obj_set_style_text_color(label, lv_color_hex(0xFFD740), 0);  // yellow
-    shown++;
+  // Live data from Trafiklab (FR-02)
+  if (live_ok) {
+    show_live_departures();
+    return;
   }
-
-  if (shown == 0) add_label(departure_list, "No departures of this type.", &lv_font_montserrat_20);
+  // No live data: tell the user instead of showing old or fake departures
+  add_label(departure_list, "No live data. Check the Wi-Fi connection.", &lv_font_montserrat_20);
+  lv_label_set_text(data_label, "");
 }
 
+// Function: Reads the saved default stop and transport type, if there are any (FR-07)
+static void load_defaults()
+{
+  prefs.begin("settings", true);                    // true = read only
+  current_stop = prefs.getInt("stop", 0);
+  current_type = prefs.getInt("type", 0);
+  prefs.end();
+
+  // Guard against old or broken values
+  if (current_stop < 0 || current_stop >= STOP_COUNT) current_stop = 0;
+  if (current_type < 0 || current_type > 3)           current_type = 0;
+}
+
+// Function: Saves the current stop and transport type as the default (FR-07)
+static void on_save_clicked(lv_event_t* e)
+{
+  LV_UNUSED(e);
+  prefs.begin("settings", false);
+  prefs.putInt("stop", current_stop);
+  prefs.putInt("type", current_type);
+  prefs.end();
+
+  lv_label_set_text(settings_status, "Saved as default");
+  Serial.printf("Saved default: %s, type %d\n", STOPS[current_stop], current_type);
+}
+
+// Function: Goes back to the saved default stop and transport type (FR-08)
+static void on_reset_clicked(lv_event_t* e)
+{
+  LV_UNUSED(e);
+  load_defaults();
+  lv_dropdown_set_selected(stop_dropdown, current_stop);
+  lv_dropdown_set_selected(type_dropdown, current_type);
+  load_live_departures();
+  show_departures();
+
+  lv_label_set_text(settings_status, "Reset to default");
+  Serial.printf("Reset to default: %s, type %d\n", STOPS[current_stop], current_type);
+}
+
+// Function: Loads and shows departures for the stop chosen in the dropdown (FR-05)
 static void on_stop_changed(lv_event_t* e)
 {
   LV_UNUSED(e);
   current_stop = lv_dropdown_get_selected(stop_dropdown);
+  load_live_departures();         // get live data for the new stop (FR-05)
   show_departures();
 }
 
+// Function: Shows departures for the transport type chosen in the dropdown (FR-06)
 static void on_type_changed(lv_event_t* e)
 {
   LV_UNUSED(e);
@@ -148,19 +222,21 @@ static void on_type_changed(lv_event_t* e)
   show_departures();
 }
 
+// Function: Goes to the departure screen
 static void on_show_clicked(lv_event_t* e)
 {
   LV_UNUSED(e);
   lv_obj_set_tile(tileview, t3, LV_ANIM_ON);
 }
 
+// Function: Goes back to the settings screen
 static void on_change_clicked(lv_event_t* e)
 {
   LV_UNUSED(e);
   lv_obj_set_tile(tileview, t2, LV_ANIM_ON);
 }
 
-// Function: Creates UI
+// Function: Creates the three screens
 static void create_ui()
 {
   // Fullscreen Tileview
@@ -168,12 +244,12 @@ static void create_ui()
   lv_obj_set_size(tileview, lv_disp_get_hor_res(NULL), lv_disp_get_ver_res(NULL));
   lv_obj_set_scrollbar_mode(tileview, LV_SCROLLBAR_MODE_OFF);
 
-  // Add three horizontal tiles (swipe between them, US2.1)
+  // Add three horizontal tiles (swipe between them, FR-03)
   t1 = lv_tileview_add_tile(tileview, 0, 0, LV_DIR_HOR);
   t2 = lv_tileview_add_tile(tileview, 1, 0, LV_DIR_HOR);
   t3 = lv_tileview_add_tile(tileview, 2, 0, LV_DIR_HOR);
 
-  // Tile #1: start screen (US1.1)
+  // Tile #1: start screen (FR-01)
   {
     make_column(t1);
     lv_obj_set_flex_align(t1, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -193,7 +269,7 @@ static void create_ui()
     add_label(t1, "Paulius Galiauskas", &lv_font_montserrat_20);
   }
 
-  // Tile #2: settings screen (US3.1, US3.2A, US3.3)
+  // Tile #2: settings screen (FR-04, FR-05, FR-06)
   {
     make_column(t2);
 
@@ -210,17 +286,24 @@ static void create_ui()
     stop_dropdown = lv_dropdown_create(t2);
     lv_dropdown_set_options(stop_dropdown, stop_options.c_str());
     lv_obj_set_width(stop_dropdown, lv_pct(100));
+    lv_dropdown_set_selected(stop_dropdown, current_stop);   // start on the saved default (FR-07)
     lv_obj_add_event_cb(stop_dropdown, on_stop_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
     type_dropdown = lv_dropdown_create(t2);
     lv_dropdown_set_options(type_dropdown, TYPE_OPTIONS);
     lv_obj_set_width(type_dropdown, lv_pct(100));
+    lv_dropdown_set_selected(type_dropdown, current_type);   // start on the saved default (FR-07)
     lv_obj_add_event_cb(type_dropdown, on_type_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
     add_button(t2, "Show departures " LV_SYMBOL_RIGHT, on_show_clicked);
+
+    // Save and reset the default settings (FR-07, FR-08)
+    add_button(t2, LV_SYMBOL_SAVE " Save as default", on_save_clicked);
+    add_button(t2, LV_SYMBOL_REFRESH " Reset to default", on_reset_clicked);
+    settings_status = add_label(t2, "", &lv_font_montserrat_20);
   }
 
-  // Tile #3: departure screen (US1.2A)
+  // Tile #3: departure screen (FR-02)
   {
     make_column(t3);
 
@@ -238,13 +321,13 @@ static void create_ui()
     lv_obj_set_style_bg_color(departure_list, lv_color_black(), 0);
     lv_obj_set_style_border_width(departure_list, 0, 0);
 
-    add_label(t3, "Demo data", &lv_font_montserrat_20);
+    data_label = add_label(t3, "", &lv_font_montserrat_20);
   }
 
   show_departures();
 }
 
-// Function: Connects to WIFI
+// Function: Connects to Wi-Fi
 static void connect_wifi()
 {
   Serial.printf("Connecting to WiFi SSID: %s\n", WIFI_SSID);
@@ -258,13 +341,13 @@ static void connect_wifi()
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi connected.");
+    Serial.println("WiFi connected.");
   } else {
     Serial.println("WiFi could not connect (timeout).");
   }
 }
 
-// Function: Asks Trafiklab for departures from one stop and prints them (US1.2B test)
+// Function: Asks Trafiklab for departures from one stop and prints them, as a start-up test (FR-02)
 static void test_trafiklab(int stop)
 {
   if (WiFi.status() != WL_CONNECTED) return;
@@ -310,15 +393,20 @@ void setup()
 
   beginLvglHelper(amoled);   // init LVGL for this board
 
+  load_defaults();           // start with the saved stop and transport type (FR-07)
   create_ui();
   lv_timer_handler();        // draw the start screen before waiting for WiFi
   connect_wifi();
 
   // Test every stop ID once (results in the serial monitor)
   for (int i = 0; i < STOP_COUNT; i++) test_trafiklab(i);
+
+  // Show live departures for the saved (or first) stop (FR-02, FR-07)
+  load_live_departures();
+  show_departures();
 }
 
-// Must have function: Loop runs continously on device after setup
+// Must have function: Loop runs continuously on device after setup
 void loop()
 {
   lv_timer_handler();
